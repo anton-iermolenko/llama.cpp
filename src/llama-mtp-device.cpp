@@ -56,6 +56,7 @@ bool llama_context::enable_mtp_device(llama_context & draft) {
                 draft.mtp_device_input_backend = draft_backend.get();
                 draft.synchronize();
                 draft.gf_res_prev->reset();
+                init_mtp_tokens(draft);
                 return true;
             }
         }
@@ -146,10 +147,12 @@ int llama_context::decode_mtp_device(llama_context & target, const llama_batch &
     ggml_backend_tensor_set(target.mtp_hidden, pending, 0, row_bytes);
     mtp_gpu_counts[3].fetch_add(row_bytes, std::memory_order_relaxed);
     mtp_input_hidden = target.mtp_hidden;
+    mtp_input_tokens = target.mtp_tokens_ready(*this, batch) ? target.mtp_token_cache : nullptr;
     struct input_guard {
-        ggml_tensor * & input;
-        ~input_guard() { input = nullptr; }
-    } guard { mtp_input_hidden };
+        ggml_tensor * & hidden;
+        ggml_tensor * & tokens;
+        ~input_guard() { hidden = nullptr; tokens = nullptr; }
+    } guard { mtp_input_hidden, mtp_input_tokens };
     return llama_decode(this, batch);
 }
 
@@ -176,4 +179,59 @@ void llama_context::copy_mtp_hidden_rows(int32_t first, int32_t count, float * d
 
 void llama_mtp_copy_hidden_rows(llama_context * target, int32_t first, int32_t count, float * dst) {
     target->copy_mtp_hidden_rows(first, count, dst);
+}
+
+void llama_context::init_mtp_tokens(const llama_context & draft) {
+    const char * enabled = getenv("LLAMA_MTP_TOKEN_REUSE");
+    if ((enabled && atoi(enabled) == 0) || &model != &draft.model || !loras->empty() || !draft.loras->empty() ||
+            model.hparams.n_embd_inp() != model.hparams.n_embd || model.hparams.f_embedding_scale != 0.0f ||
+            cparams.n_batch != draft.cparams.n_batch || cparams.n_ubatch != draft.cparams.n_ubatch) {
+        return;
+    }
+    const auto * mtp_weight = model.layers[model.hparams.n_layer()].nextn.embed_tokens;
+    if (mtp_weight && mtp_weight != model.tok_embd) {
+        return;
+    }
+    ggml_init_params params = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) { return; }
+    auto * scratch = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, model.hparams.n_embd, cparams.n_ubatch);
+    auto * cache = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, model.hparams.n_embd, cparams.n_batch);
+    ggml_set_name(scratch, "mtp_token_scratch");
+    ggml_set_name(cache, "mtp_token_cache");
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors(ctx.get(), mtp_device_output_backend) };
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: allocation failed; using separate token embeddings\n", __func__);
+        return;
+    }
+    synchronize();
+    gf_res_prev->reset();
+    mtp_token_ctx = std::move(ctx);
+    mtp_token_buf = std::move(buf);
+    mtp_token_scratch = scratch;
+    mtp_token_cache = cache;
+    LLAMA_LOG_WARN("%s: shared token table, resident buffers %.3f MiB\n", __func__,
+            ggml_backend_buffer_get_size(mtp_token_buf.get())/1048576.0);
+}
+
+void llama_context::capture_mtp_tokens(ggml_tensor * tensor, int64_t first, int64_t count) {
+    // The fixed scratch address preserves graph reuse across microbatches.
+    GGML_ASSERT(tensor && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor));
+    GGML_ASSERT(tensor->ne[0] == model.hparams.n_embd && tensor->ne[1] == count);
+    GGML_ASSERT(first == mtp_token_rows);
+    auto dst = llama_mtp_device_rows(mtp_token_cache, first, count);
+    ggml_backend_tensor_copy_async(mtp_device_output_backend, mtp_device_output_backend, tensor, &dst);
+    mtp_token_rows += count;
+}
+
+bool llama_context::mtp_tokens_ready(const llama_context & draft, const llama_batch & batch) const {
+    if (!mtp_token_cache || batch.n_tokens <= 32 || mtp_token_rows != batch.n_tokens ||
+            !loras->empty() || !draft.loras->empty() || !batch.token || !batch.pos ||
+            mtp_token_ids.size() != (size_t) batch.n_tokens || mtp_token_pos.size() != (size_t) batch.n_tokens) {
+        return false;
+    }
+    const size_t n = batch.n_tokens;
+    return std::equal(mtp_token_ids.begin(), mtp_token_ids.end(), batch.token) &&
+           std::equal(mtp_token_pos.begin(), mtp_token_pos.end(), batch.pos) &&
+           n <= cparams.n_batch;
 }

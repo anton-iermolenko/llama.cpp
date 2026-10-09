@@ -1379,6 +1379,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (mtp_device_input_backend && res->t_mtp_h_input) {
             ggml_backend_sched_set_tensor_backend(sched.get(), res->t_mtp_h_input, mtp_device_input_backend);
         }
+        if (mtp_device_input_backend && res->t_mtp_token_input) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), res->t_mtp_token_input, mtp_device_input_backend);
+        }
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1413,6 +1416,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    mtp_token_rows = 0;
+    mtp_token_ids.clear();
+    mtp_token_pos.clear();
     mtp_hidden_rows = 0;
     mtp_hidden_host_valid.clear();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
@@ -1721,6 +1727,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    mtp_token_rows = 0;
+    mtp_token_ids.clear();
+    mtp_token_pos.clear();
+    const bool capture_tokens = mtp_token_cache && loras->empty() && batch_inp.token &&
+            !batch_inp.embd && batch_inp.pos && batch_inp.n_tokens > 32 &&
+            n_tokens_all == (uint32_t) batch_inp.n_tokens;
+    if (capture_tokens) {
+        mtp_token_ids.assign(batch_inp.token, batch_inp.token + batch_inp.n_tokens);
+        mtp_token_pos.assign(batch_inp.pos, batch_inp.pos + batch_inp.n_tokens);
+    }
     mtp_hidden_rows = 0;
     if (mtp_device_output_enabled) {
         mtp_hidden_host_valid.assign(n_tokens_all, 0);
@@ -1821,6 +1837,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         auto ubatch = mctx->get_ubatch();
+        if (capture_tokens) {
+            ubatch.mtp_token_capture = mtp_token_scratch;
+        }
+        if (mtp_input_tokens) {
+            ubatch.mtp_token_input = mtp_input_tokens;
+            ubatch.mtp_token_first = n_tokens_prev;
+        }
         if (mtp_input_hidden) {
             GGML_ASSERT(ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == 0);
             GGML_ASSERT(ubatch.pos[0] == batch_inp.pos[n_tokens_prev]);
@@ -1967,6 +1990,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (capture_tokens) {
+            capture_mtp_tokens(res->t_inp_embd, n_tokens_prev, ubatch.n_tokens);
+        }
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before

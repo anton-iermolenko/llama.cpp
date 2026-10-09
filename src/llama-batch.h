@@ -69,6 +69,9 @@ struct llama_ubatch {
 
     const ggml_tensor * mtp_hidden = nullptr;
     int64_t mtp_hidden_first = 0;
+    ggml_tensor * mtp_token_capture = nullptr;
+    const ggml_tensor * mtp_token_input = nullptr;
+    int64_t mtp_token_first = 0;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

@@ -514,7 +514,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // TODO: make static using `ggml_build_forward_select()`
     //       see llm_graph_context::build_inp_embd() for reference
     ggml_tensor * tok_embd;
-    if (ubatch.token) {
+    if (ubatch.mtp_token_input) {
+        GGML_ASSERT(ubatch.token);
+        inp->e = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_input(inp->e);
+        ggml_set_name(inp->e, "mtp_token_input");
+        res->t_mtp_token_input = inp->e;
+        tok_embd = inp->e;
+    } else if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);

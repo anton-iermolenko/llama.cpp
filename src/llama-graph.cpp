@@ -95,7 +95,13 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
-    if (ubatch->token) {
+    if (ubatch->mtp_token_input) {
+        GGML_ASSERT(e && !ggml_backend_buffer_is_host(e->buffer));
+        auto src = llama_mtp_device_rows(ubatch->mtp_token_input, ubatch->mtp_token_first, n_tokens);
+        GGML_ASSERT(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(e->buffer)) ==
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src.buffer)));
+        ggml_backend_tensor_copy(&src, e);
+    } else if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
@@ -1329,6 +1335,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
+    t_mtp_token_input = nullptr;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
@@ -2377,6 +2384,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
     }
 
+    if (ubatch.mtp_token_capture) {
+        ggml_set_name(cur, "mtp_token_source");
+        ggml_tensor * dst = ggml_view_2d(ctx0, ubatch.mtp_token_capture, n_embd, n_tokens,
+                ubatch.mtp_token_capture->nb[1], 0);
+        cur = ggml_cpy(ctx0, cur, dst);
+    }
     res->t_inp_embd = cur;
 
     // For Granite architecture

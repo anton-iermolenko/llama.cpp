@@ -408,4 +408,16 @@ private:
     int64_t mtp_hidden_rows = 0;
     std::vector<uint8_t> mtp_hidden_host_valid;
     ggml_tensor * mtp_input_hidden = nullptr;
+
+    void init_mtp_tokens(const llama_context & draft);
+    void capture_mtp_tokens(ggml_tensor * tensor, int64_t first, int64_t count);
+    bool mtp_tokens_ready(const llama_context & draft, const llama_batch & batch) const;
+    ggml_context_ptr mtp_token_ctx;
+    ggml_backend_buffer_ptr mtp_token_buf;
+    ggml_tensor * mtp_token_scratch = nullptr;
+    ggml_tensor * mtp_token_cache = nullptr;
+    ggml_tensor * mtp_input_tokens = nullptr;
+    int64_t mtp_token_rows = 0;
+    std::vector<llama_token> mtp_token_ids;
+    std::vector<llama_pos> mtp_token_pos;
 };
