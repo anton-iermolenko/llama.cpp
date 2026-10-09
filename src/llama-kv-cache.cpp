@@ -342,7 +342,6 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
     // pre-compute the haramard matrices and keep them in host memory
-    // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
     if (attn_rot_k || attn_rot_v) {
         for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
@@ -362,8 +361,69 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    init_device_rotation();
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+void llama_kv_cache::init_device_rotation() {
+    const char * enabled = getenv("LLAMA_KV_ROT_GPU");
+    if ((enabled && atoi(enabled) == 0) || hparams.no_alloc ||
+            model.arch != LLM_ARCH_QWEN35 || !(attn_rot_k || attn_rot_v) || layers.empty()) {
+        return;
+    }
+
+    // Restrict this fast path to a single CUDA buffer type for every KV layer.
+    // Other placements retain graph inputs and the existing host implementation.
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layers.front().k->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev || ggml_backend_buft_is_host(buft) ||
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
+        return;
+    }
+    for (const auto & layer : layers) {
+        if (ggml_backend_buffer_get_type(layer.k->buffer) != buft ||
+                (layer.v && ggml_backend_buffer_get_type(layer.v->buffer) != buft)) {
+            return;
+        }
+    }
+
+    ggml_init_params params = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return;
+    }
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+    if (attn_rot_k) {
+        int64_t nrot = 64;
+        do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
+        nrot /= 2;
+        k = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot, nrot);
+        ggml_set_name(k, "attn_inp_k_rot");
+    }
+    if (attn_rot_v) {
+        v = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 64, 64);
+        ggml_set_name(v, "attn_inp_v_rot");
+    }
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: allocation failed; using host rotation inputs\n", __func__);
+        return;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (ggml_tensor * t : { k, v }) {
+        if (t) {
+            ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
+        }
+    }
+    LLAMA_LOG_INFO("%s: %s immutable rotation buffer = %.3f MiB\n", __func__,
+            ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+    attn_rot_k_device = k;
+    attn_rot_v_device = v;
+    attn_rot_ctx = std::move(ctx);
+    attn_rot_buf = std::move(buf);
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -694,6 +754,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
         }
+    }
+
+    if (attn_rot_buf) {
+        ret[ggml_backend_buffer_get_type(attn_rot_buf.get())] += ggml_backend_buffer_get_size(attn_rot_buf.get());
     }
 
     return ret;
@@ -1433,6 +1497,10 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+    if (attn_rot_k_device) {
+        return attn_rot_k_device;
+    }
+
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
@@ -1454,6 +1522,10 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 }
 
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
+    if (attn_rot_v_device) {
+        return attn_rot_v_device;
+    }
+
     ggml_tensor * res = nullptr;
 
     if (attn_rot_v) {
@@ -1811,6 +1883,10 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (attn_rot_k_device && dst == attn_rot_k_device) {
+        return; // This immutable leaf is already initialized and is not a graph input.
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -1820,6 +1896,10 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (attn_rot_v_device && dst == attn_rot_v_device) {
+        return; // This immutable leaf is already initialized and is not a graph input.
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
