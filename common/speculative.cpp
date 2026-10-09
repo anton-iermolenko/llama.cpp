@@ -1353,6 +1353,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    bool gpu_handoff = false;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1385,6 +1386,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        std::fill(batch.embd, batch.embd + (size_t) n_b * n_embd, 0.0f);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1435,6 +1437,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        const char * requested = std::getenv("LLAMA_MTP_GPU_HANDOFF");
+        if ((!requested || std::strcmp(requested, "0") != 0) && this->params.n_max >= 0 &&
+            std::count(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0 &&
+            std::all_of(params.types.begin(), params.types.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            })) {
+            gpu_handoff = llama_mtp_enable_gpu_handoff(ctx_tgt, ctx_dft);
+            SPC_WRN("GPU hidden-state handoff %s\n", gpu_handoff ? "enabled" : "unavailable; using host path");
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1509,7 +1520,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         // Target NextN rows are dense because the target context is unmasked.
-        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+        const bool use_gpu = gpu_handoff && llama_mtp_gpu_handoff_ready(ctx_tgt, ctx_dft, batch_in);
+        const float * h_tgt = use_gpu ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1525,7 +1537,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                if (!use_gpu) { std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1)); }
             }
 
             // fill the pending embeddings from a previous run
@@ -1538,7 +1550,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                if (!use_gpu) { set_h(i_batch_beg[seq_id], pending_h[seq_id].data()); }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1556,7 +1568,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = use_gpu
+                    ? llama_decode_mtp_gpu(ctx_dft, ctx_tgt, batch, pending_h[0].data())
+                    : llama_decode(ctx_dft, batch);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1580,13 +1594,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
-
-            std::memcpy(verify_h[seq_id].data(),
-                    h_tgt + (size_t) i_batch_beg[seq_id] * n_embd, row_bytes * n_rows);
-
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            if (use_gpu) {
+                // Acceptance selects at most n_max; keep those rows across later decodes.
+                const int32_t keep_rows = (int32_t) std::min<int64_t>(n_rows, (int64_t) this->params.n_max + 1);
+                verify_h_rows[seq_id] = keep_rows;
+                verify_h[seq_id].resize((size_t) keep_rows * n_embd);
+                llama_mtp_copy_hidden_rows(ctx_tgt, i_batch_beg[seq_id], keep_rows, verify_h[seq_id].data());
+                const float * last = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]);
+                std::memcpy(pending_h[seq_id].data(), last, row_bytes);
+            } else {
+                verify_h[seq_id].resize((size_t) n_rows * n_embd);
+                std::memcpy(verify_h[seq_id].data(),
+                        h_tgt + (size_t) i_batch_beg[seq_id] * n_embd, row_bytes * n_rows);
+                std::memcpy(pending_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            }
         }
 
         return true;

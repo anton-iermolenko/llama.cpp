@@ -945,6 +945,7 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 }
 
 float * llama_context::get_embeddings_nextn() {
+    read_mtp_hidden(0, mtp_hidden_rows);
     output_reorder();
 
     return embd_nextn.data;
@@ -965,6 +966,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
             if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size) {
                 throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / n_embd));
             }
+            if (mtp_hidden_rows > 0) { read_mtp_hidden(i, 1); }
             return embd_nextn.data + (size_t) i * n_embd;
         }
 
@@ -1374,6 +1376,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (mtp_device_input_backend && res->t_mtp_h_input) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), res->t_mtp_h_input, mtp_device_input_backend);
+        }
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1386,6 +1391,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        if (mtp_device_input_backend && res->t_mtp_h_input) {
+            // Device inputs can still be read by the previous asynchronous decode.
+            ggml_backend_synchronize(mtp_device_input_backend);
+        }
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1404,6 +1413,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    mtp_hidden_rows = 0;
+    mtp_hidden_host_valid.clear();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1710,6 +1721,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    mtp_hidden_rows = 0;
+    if (mtp_device_output_enabled) {
+        mtp_hidden_host_valid.assign(n_tokens_all, 0);
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
@@ -1804,7 +1820,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     do {
-        const auto & ubatch = mctx->get_ubatch();
+        auto ubatch = mctx->get_ubatch();
+        if (mtp_input_hidden) {
+            GGML_ASSERT(ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == 0);
+            GGML_ASSERT(ubatch.pos[0] == batch_inp.pos[n_tokens_prev]);
+            ubatch.mtp_hidden = mtp_input_hidden;
+            ubatch.mtp_hidden_first = n_tokens_prev;
+        }
 
         // count the outputs in this ubatch
         {
@@ -1962,7 +1984,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (!capture_mtp_hidden(t_h_nextn, backend_h, offset, n_rows)) {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
             }
         }
 

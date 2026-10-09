@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-mtp-device.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -110,7 +111,16 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     if (ubatch->embd) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        if (ubatch->mtp_hidden) {
+            auto src = llama_mtp_device_rows(ubatch->mtp_hidden, ubatch->mtp_hidden_first, n_tokens);
+            GGML_ASSERT(!ggml_backend_buffer_is_host(h->buffer));
+            GGML_ASSERT(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(h->buffer)) ==
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src.buffer)));
+            ggml_backend_tensor_copy(&src, h);
+            llama_mtp_count_device_input(ggml_nbytes(h));
+        } else {
+            ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        }
     }
 }
 
@@ -1323,6 +1333,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_mtp_h_input = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);

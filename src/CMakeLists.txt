@@ -16,6 +16,8 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-mtp-device.cpp
+            llama-mtp-device.h
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp

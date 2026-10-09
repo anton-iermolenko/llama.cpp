@@ -88,6 +88,11 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    bool enable_mtp_device(llama_context & draft);
+    bool mtp_handoff_ready(const llama_context & draft, const llama_batch & batch) const;
+    int decode_mtp_device(llama_context & target, const llama_batch & batch, const float * pending);
+    void copy_mtp_hidden_rows(int32_t first, int32_t count, float * dst);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -391,4 +396,16 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    bool capture_mtp_hidden(ggml_tensor * tensor, ggml_backend_t backend, int64_t first, int64_t count);
+    void read_mtp_hidden(int64_t first, int64_t count);
+    bool mtp_device_output_enabled = false;
+    ggml_backend_t mtp_device_output_backend = nullptr;
+    ggml_backend_t mtp_device_input_backend = nullptr;
+    ggml_context_ptr mtp_hidden_ctx;
+    ggml_backend_buffer_ptr mtp_hidden_buf;
+    ggml_tensor * mtp_hidden = nullptr;
+    int64_t mtp_hidden_rows = 0;
+    std::vector<uint8_t> mtp_hidden_host_valid;
+    ggml_tensor * mtp_input_hidden = nullptr;
 };

@@ -95,6 +95,14 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Private Qwen35 single-sequence, same-CUDA-device handoff.
+LLAMA_API bool llama_mtp_enable_gpu_handoff(llama_context * target, llama_context * draft);
+LLAMA_API bool llama_mtp_gpu_handoff_ready(llama_context * target, llama_context * draft, const llama_batch & batch);
+LLAMA_API int32_t llama_decode_mtp_gpu(llama_context * draft, llama_context * target, llama_batch batch, const float * pending);
+// Captured D2D, draft input D2D, hidden D2H, pending H2D bytes.
+LLAMA_API void llama_mtp_gpu_stats(uint64_t * counts, bool reset);
+LLAMA_API void llama_mtp_copy_hidden_rows(llama_context * target, int32_t first, int32_t count, float * dst);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
