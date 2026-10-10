@@ -1,7 +1,8 @@
 # Local llama-server fixes
 
 The maintained Git source is `C:/Users/anton/Projects/forks/llama.cpp`.
-Upstream: https://github.com/ggml-org/llama.cpp.git (`origin`).
+Fork: https://github.com/anton-iermolenko/llama.cpp (`origin`).
+Upstream: https://github.com/ggml-org/llama.cpp.git (`upstream`).
 Base: llama.cpp b10809, `5266f24da75dc449bd56cbed7addb9c8e4a6a73e`.
 Migrated on 2026-10-09 from the existing local-gpu-llm patches.
 
@@ -54,3 +55,6 @@ The active runtime remains `runtime/llama-b10809-mtp-embedding`. Its build recor
 is `results/mtp-embedding-reuse/build-report.json`. Existing evidence covers the
 local Qwen35 setup; the migration does not establish support for other models or
 backends.
+
+The five local branches were published to the GitHub fork on 2026-10-10.
+Each branch tracks its corresponding origin branch. No upstream PR was opened.
